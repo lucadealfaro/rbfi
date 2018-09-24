@@ -23,6 +23,7 @@ Framework files (small shared functionality):
     python mnist_rbfi_pytorch.py --layers="64,64,64" --andor="v^v^"
     
 Note above that we give one more component to andor than to layers, because an implicit layer with 10 neurons is automatically added at the "top", corresponding to the 10 digits. 
+Note also that the _andor_ argument is compulsory, as you need to specify layer types.
 
 ## Requirements
 

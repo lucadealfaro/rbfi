@@ -6,6 +6,7 @@
 from torch.nn import Linear
 import torch
 import numpy as np
+from json_plus import Serializable
 
 """Implementation of a linear neural net with sensitivity analysis."""
 
@@ -39,3 +40,25 @@ class LinearWithSensitivity(Linear):
         w = previous_layer * self.weight
         s = torch.sum(torch.abs(w), -1)
         return s
+
+    def dumps(self):
+        d = dict(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            weight=self.weight.data.cpu().numpy(),
+            bias=None if self.bias is None else self.bias.data.cpu().numpy(),
+        )
+        return Serializable.dumps(d)
+
+    @staticmethod
+    def loads(s, device):
+        d = Serializable.loads(s)
+        m = LinearWithSensitivity(
+            d['in_features'],
+            d['out_features'],
+            bias=d['bias'] is not None
+        )
+        m.weight.data = torch.from_numpy(d['weight']).to(device)
+        if d['bias'] is not None:
+            m.bias.data = torch.from_numpy(d['bias']).to(device)
+        return m

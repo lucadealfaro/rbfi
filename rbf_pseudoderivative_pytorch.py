@@ -10,7 +10,9 @@ from torch.nn.parameter import Parameter
 from torch.autograd.function import Function
 
 import numpy as np
+from json_plus import Serializable
 
+import unittest
 
 from torch_bounded_parameters import BoundedParameter
 
@@ -85,6 +87,45 @@ class RBFPseudoDerivativeLayer(nn.Module):
         self.u.data.uniform_(0.2, 0.7) # These could be parameters.
         self.u.data.clamp_(min_slope, max_slope)
 
+    def dumps(self):
+        """Writes itself to a string."""
+        # Creates a dictionary
+        d = dict(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            min_input=self.w.lower_bound,
+            max_input=self.w.upper_bound,
+            min_slope=self.u.lower_bound,
+            max_slope=self.u.upper_bound,
+            modinf=self.modinf,
+            regular_deriv=self.regular_deriv,
+            andor=self.andor,
+            andor01=self.andor01.cpu().numpy(),
+            u=self.u.data.cpu().numpy(),
+            w=self.w.data.cpu().numpy(),
+        )
+        return Serializable.dumps(d)
+
+    @staticmethod
+    def loads(s, device):
+        """Reads itself from string s."""
+        d = Serializable.loads(s)
+        m = RBFPseudoDerivativeLayer(
+            d['in_features'],
+            d['out_features'],
+            andor=d['andor'],
+            modinf=d['modinf'],
+            regular_deriv=d['regular_deriv'],
+            min_input=d['min_input'],
+            max_input=d['max_input'],
+            min_slope=d['min_slope'],
+            max_slope=d['max_slope']
+        )
+        m.u.data = torch.from_numpy(d['u']).to(device)
+        m.w.data = torch.from_numpy(d['w']).to(device)
+        m.andor01.data = torch.from_numpy(d['andor01']).to(device)
+        return m
+
     def forward(self, x):
         # Let n be the input size, and m the output size.
         # The tensor x is of shape * n. To make room for the output,
@@ -137,11 +178,100 @@ class RBFPseudoDerivativeLayer(nn.Module):
             previous_layer.fill_(1.)
         else:
             previous_layer = previous_layer.view(1, self.in_features)
-        u = previous_layer * self.u
+        u_prod = previous_layer * self.u
         if self.modinf:
-            s = torch.max(u, -1)[0]
+            # s = torch.max(u_prod, -1)[0]
+            s = SharedFeedbackMax.apply(u_prod)
         else:
-            s = torch.sqrt(torch.sum(u * u, -1))
-        s *= np.sqrt(2. / np.e)
+            s = torch.sqrt(torch.sum(u_prod * u_prod, -1))
+        s = s * np.sqrt(2. / np.e)
         return s
 
+
+class TestRBF(unittest.TestCase):
+
+    def setup_layer(self, andor="^", regular_deriv=False, modinf=False, single_norm=False):
+        layer = RBFPseudoDerivativeLayer(2, 3, andor=andor, modinf=modinf, regular_deriv=regular_deriv,
+                                         single_normalization=single_norm)
+        # I want to start from simple numbers.
+        layer.w.data.mul_(0.)
+        layer.u.data.mul_(0.)
+        layer.u.data.add_(torch.tensor([[3., 2.], [4., 3.], [1., 2]]))
+        layer.w.data.add_(torch.tensor([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]]))
+        return layer
+
+    # @unittest.skip("later")
+    def test_all_forwards(self):
+        """The methods differ only for how they do backward propagation,
+        so we should get the same results."""
+        layer1 = self.setup_layer(regular_deriv=True)
+        layer2 = self.setup_layer(single_norm=True)
+        layer3 = self.setup_layer()
+        x = torch.tensor([1.0, 1.0])
+        y1 = layer1(x)
+        y2 = layer2(x)
+        y3 = layer3(x)
+        self.assertAlmostEqual(torch.sum(torch.abs(y1 - y2)), 0.0, 3)
+        self.assertAlmostEqual(torch.sum(torch.abs(y1 - y3)), 0.0, 3)
+
+
+    # @unittest.skip("later")
+    def test_forward(self):
+        layer_and = self.setup_layer(regular_deriv=True)
+        layer_or = self.setup_layer(andor="v")
+        print("w:", layer_and.w)
+        print("u:", layer_and.u)
+        x = torch.tensor([1.0, 1.0])
+        y_and = layer_and(x)
+        y_or = layer_or(x)
+        y = y_and + y_or
+        self.assertAlmostEqual(torch.sum(torch.abs(y - torch.tensor([1., 1., 1.]))), 0.0, 3)
+        print("y:", y)
+        print("y_and:", y_and)
+        print("y_or:", y_or)
+
+    @unittest.skip("later")
+    def test_naming(self):
+        l = self.setup_layer()
+        for n, p in l.named_parameters():
+            if p.requires_grad:
+                print (n, p, "l:", p.lower_bound, "u:", p.upper_bound)
+
+    # @unittest.skip("later")
+    def test_back(self):
+        # With regular derivatives first.
+        regular_layer = self.setup_layer(regular_deriv=True)
+        x = torch.tensor([1.1, 1.2], requires_grad=True)
+        y0 = regular_layer(x)
+        y0.backward(torch.tensor([1., 1., 1.]))
+        print("Normal x.grad:", x.grad)
+        x1 = x - 0.01 * x.grad
+        with torch.no_grad():
+            y1 = regular_layer(x1)
+        print("Normal y0 - y1:", y0 - y1)
+
+        # Then, with faster derivatives:
+        fast_layer = self.setup_layer()
+        x = torch.tensor([1.1, 1.2], requires_grad=True)
+        y0 = fast_layer(x)
+        y0.backward(torch.tensor([1., 1., 1.]))
+        print("Fast x.grad:", x.grad)
+        x1 = x - 0.01 * x.grad
+        with torch.no_grad():
+            y1 = fast_layer(x1)
+        print("Fast y0 - y1:", y0 - y1)
+
+        # Then, with fast, single normalization derivatives:
+        fast_layer = self.setup_layer(single_norm=True)
+        x = torch.tensor([1.1, 1.2], requires_grad=True)
+        y0 = fast_layer(x)
+        y0.backward(torch.tensor([1., 1., 1.]))
+        print("Fast single_norm x.grad:", x.grad)
+        x1 = x - 0.01 * x.grad
+        with torch.no_grad():
+            y1 = fast_layer(x1)
+        print("Fast single_norm y0 - y1:", y0 - y1)
+
+
+if __name__ == '__main__':
+    unittest.main()
