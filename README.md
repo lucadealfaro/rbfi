@@ -45,18 +45,11 @@ There are many more options; please refer to the command line options of mnist_p
 * **nn_linear_pytorch_sensitivity** : wrapper around linear layers in Pytorch, to compute network sensitivity for regularization purposes.  Used mainly to expriment. 
 * **square_distance_loss.py** : implementation of square distance loss. 
 * **torch_bounded_parameters.py** : implementation of bounded parameters in pytorch. 
-* **simple_json.py** : enables efficient serialization of numpy arrays (and more) using json.
-
-## Sample command lines. 
-
-    python mnist_rbfi_pytorch.py --layers="64,64,64" --andor="v^v^"
-    
-Note above that we give one more component to andor than to layers, because an implicit layer with 10 neurons is automatically added at the "top", corresponding to the 10 digits. 
-Note also that the _andor_ argument is compulsory, as you need to specify layer types.
+* **json_plus.py** : enables efficient serialization of numpy arrays (and more) using json.
 
 ## Requirements
 
-* PyTorch 
+* PyTorch (0.4.0 or later)
 * Numpy
 
 ## Author
