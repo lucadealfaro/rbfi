@@ -30,13 +30,13 @@ Trains for 10 epochs a ReLU network with layers of 64, 64, 64, 10 neurons on MNI
 At the end, tests the performance on the test set.
 Two files are produced: one that contains the run parameters, and the testing results, and one that contains the trained network weights.
 
-    python mnist_pytorch.py --layers="64,64,64" --rbf --modinf --epochs=10
+    python mnist_pytorch.py --layers="64,64,64" --rbfi --epochs=10
 
 Same as above, but uses RBFI units.
 
 Let measure_something.json be the generated file containing the run parameters, and measure_something_0.model.json be the trained network.  You can re-read this trained network, and evaluate its susceptibility to FSGM, I-FSGM, and PGD attacks via:
 
-    python mnist_pytorch.py --model_file="measure_something_0" --rbf --modinf --test_fgsm --test_ifgsm --test_pgd
+    python mnist_pytorch.py --model_file="measure_something_0" --rbfi --test_fgsm --test_ifgsm --test_pgd
 
 There are many more options; please refer to the command line options of mnist_pytorch.py for more information.
 
