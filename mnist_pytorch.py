@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 import numpy as np
-from rbf_pseudoderivative_pytorch import RBFPseudoDerivativeLayer
+from rbfi import RBFI
 from square_distance_loss import square_distance_loss
 from torch_bounded_parameters import ParamBoundEnforcer
 from test_pgd import pgd_attack, pgd_batch_attack, compute_pgd_example
@@ -29,6 +29,18 @@ loss_sigmoid = square_distance_loss
 
 cross_entropy_loss = nn.CrossEntropyLoss()
 nll_loss = nn.NLLLoss()
+
+def loss_soft_dist(output, target):
+    soft_output = F.softmax(output, dim=1)
+    return square_distance_loss(soft_output, target)
+
+def get_loss_function(args):
+    if args.rbf:
+        return square_distance_loss
+    elif args.sigmoid:
+        return loss_sigmoid
+    else:
+        return loss_relu
 
 class StdNet(nn.Module):
     """Standard neural net, which can be sigmoid or RELU, depending on flags."""
@@ -101,13 +113,12 @@ class RBFNet(nn.Module):
         if not empty:
             previous_size = 28 * 28
             for i, size in enumerate(layer_sizes):
-                l = RBFPseudoDerivativeLayer(previous_size, size,
-                                             andor=args.andor[i],
-                                             modinf=args.modinf,
-                                             min_slope=args.min_slope,
-                                             max_slope=args.max_slope,
-                                             init_slope=args.init_slope,
-                                             regular_deriv=args.regular_deriv)
+                l = RBFI(previous_size, size,
+                         andor=args.andor[i],
+                         modinf=args.modinf,
+                         min_slope=args.min_slope,
+                         max_slope=args.max_slope,
+                         regular_deriv=args.regular_deriv)
                 self.layers.append(l)
                 self.add_module('layer_%d' % i, l)
                 previous_size = size
@@ -146,7 +157,7 @@ class RBFNet(nn.Module):
         args = Storage(d['args'])
         m = RBFNet(args, empty=True)
         for i, ms in enumerate(d['layers']):
-            l = RBFPseudoDerivativeLayer.loads(ms, device)
+            l = RBFI.loads(ms, device)
             m.layers.append(l)
             m.add_module('layer_%d' % i, l)
         return m
@@ -171,12 +182,12 @@ def write_model(m, out_fn):
         json.dump(d, f)
 
 
-def train_once(args, model, flat_data, target, meta_optimizer):
+def train_once(args, loss_function, model, flat_data, target, meta_optimizer):
     if args.rbf:
         # For RBF, the optimizer also enforces parameter bounds.
         meta_optimizer.optimizer.zero_grad()
         output = model(flat_data)
-        primary_loss = square_distance_loss(output, target)
+        primary_loss = loss_function(output, target)
         loss = (primary_loss +
                 + args.sensitivity_cost * model.sensitivity()
                 + args.l1_regularization * model.regularization()
@@ -197,13 +208,13 @@ def train_once(args, model, flat_data, target, meta_optimizer):
 def train(args, model, device, train_loader, meta_optimizer, epoch):
     model.train()
     correct = 0.
-    loss_function = square_distance_loss if args.rbf else loss_sigmoid if args.sigmoid else loss_relu
+    loss_function = get_loss_function(args)
     for batch_idx, (data_cpu, target_cpu) in enumerate(train_loader):
         data_cpu = data_cpu.view(-1, 28 * 28)
         x_input, target = data_cpu.to(device), target_cpu.to(device)
         if args.train_adv > 0.:
             x_input.requires_grad = True
-        output, loss = train_once(args, model, x_input, target, meta_optimizer)
+        output, loss = train_once(args, loss_function, model, x_input, target, meta_optimizer)
         pred = output.max(1, keepdim=True)[1]
         correct += pred.eq(target.view_as(pred)).sum().item()
         # Adversarial training, if requested.
@@ -213,7 +224,7 @@ def train(args, model, device, train_loader, meta_optimizer, epoch):
                                                   loss_function, num_iterations=args.train_adv_steps)
                 # We check that the input is in the proper distance ball.
                 assert torch.max(torch.abs(x_input - x_input_adv)).item() < args.train_adv * 1.01
-                train_once(args, model, x_input_adv, target, meta_optimizer)
+                train_once(args, loss_function, model, x_input_adv, target, meta_optimizer)
             else:
                 step_epsilon = args.train_adv / float(args.train_adv_steps)
                 for adversarial_step in range(args.train_adv_steps):
@@ -228,7 +239,7 @@ def train(args, model, device, train_loader, meta_optimizer, epoch):
                         loss = loss_function(output, target)
                         loss.backward()
                     else:
-                        train_once(args, model, x_input, target, meta_optimizer)
+                        train_once(args, loss_function, model, x_input, target, meta_optimizer)
         if (batch_idx + 1) % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} \tAccuracy:{:.5f} Sensitivity: {}'.format(
                 epoch, (batch_idx + 1) * len(data_cpu), len(train_loader.dataset),
@@ -266,9 +277,10 @@ def test(args, model, device, test_loader):
     return accuracy, sensitivity
 
 def test_fsgm(args, model, device, test_loader):
-    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.05, 0.05)
+    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.01, 0.05)
     correctnesses = []
-    model.set_regular_deriv(True)
+    if not args.pseudo_adv:
+        model.set_regular_deriv(True)
     for epsilon in epsilons:
         correct = 0.
         for i, (data, target) in enumerate(test_loader):
@@ -295,9 +307,10 @@ def test_fsgm(args, model, device, test_loader):
     return result
 
 def test_adversarial_multistep(args, model, device, test_loader):
-    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.05, 0.05)
+    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.01, 0.05)
     correctnesses = []
-    model.set_regular_deriv(True)
+    if not args.pseudo_adv:
+        model.set_regular_deriv(True)
     for epsilon in epsilons:
         correct = 0.
         step_epsilon = epsilon / float(args.adversarial_steps)
@@ -329,9 +342,10 @@ def test_adversarial_multistep(args, model, device, test_loader):
     return result
 
 def test_ifgsm(args, model, device, test_loader):
-    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.05, 0.05)
+    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.01, 0.05)
     correctnesses = []
-    model.set_regular_deriv(True)
+    if not args.pseudo_adv:
+        model.set_regular_deriv(True)
     for epsilon in epsilons:
         correct = 0.
         step_epsilon = epsilon / float(args.adversarial_steps)
@@ -362,7 +376,7 @@ def test_ifgsm(args, model, device, test_loader):
     return result
 
 def test_perturbation(args, model, device, test_loader):
-    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.05, 0.05)
+    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.01, 0.05)
     correctnesses = []
     for epsilon in epsilons:
         correct = 0.
@@ -387,14 +401,16 @@ def test_perturbation(args, model, device, test_loader):
 
 
 def test_pgd(args, model, device, kwargs):
-    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.05, 0.05)
-    model.set_regular_deriv(True)
+    epsilons = np.arange(args.epsilon_min, args.epsilon_max + 0.01, 0.05)
+    if not args.pseudo_adv:
+        model.set_regular_deriv(True)
     pgd_loader = torch.utils.data.DataLoader(
         datasets.MNIST('../data', train=False, transform=transforms.ToTensor()),
         batch_size=args.pgd_batch, shuffle=True, **kwargs)
     loss_function = square_distance_loss if args.rbf else (
         loss_sigmoid if args.sigmoid else loss_relu)
     success_rate = [] # Success rate of the model, not of the attack, to be homogeneous.
+    accuracy_vs_restarts_by_epsilon = {}
     for epsilon in epsilons:
         if args.pgd_batch == 1:
             # We do one by one, stopping as soon as we get success.
@@ -412,24 +428,47 @@ def test_pgd(args, model, device, kwargs):
         else:
             # We do in batches.
             fractions = []
+            # I need to average the accuracy vs restarts on all batches.
+            # So I accumulate the results in a list of numpy vectors.
+            accuracy_vs_restart_list = []
             for i, (data, target) in enumerate(pgd_loader):
                 flat_data = data.view(-1, 28 * 28)
-                fractions.append(pgd_batch_attack(
+                avs, fraction = pgd_batch_attack(
                     model, device, flat_data, target, epsilon, loss_function,
                     num_iterations=args.pgd_iterations,
-                    num_restarts=args.pgd_restarts))
+                    num_restarts=args.pgd_restarts)
+                fractions.append(fraction)
+                accuracy_vs_restart_list.append(np.array(avs))
                 if i + 1 >= args.pgd_inputs / args.pgd_batch:
                     break
             success_rate.append(float(np.mean(fractions)))
+            # Now I need to average the success rate by epsilon.
+            accuracy_vs_restart = list(np.average(np.vstack(accuracy_vs_restart_list), 0))
+            accuracy_vs_restart = [float(x) for x in accuracy_vs_restart]
+            accuracy_vs_restarts_by_epsilon[epsilon] = accuracy_vs_restart
     model.set_regular_deriv(args.regular_deriv)
-    result = zip(epsilons, success_rate)
+    accuracy = zip(epsilons, success_rate)
     print("Performance under PGD:")
-    for epsilon, c in result:
+    for epsilon, c in accuracy:
         print("  Epsilon: {:.2f} Correctness: {}".format(epsilon, 1. - c))
-    return result
+    return accuracy, accuracy_vs_restarts_by_epsilon
 
 
-def main():
+def flatten(s):
+    out = []
+    for t in s:
+        if isinstance(t, str):
+            out.append(t)
+        else:
+            out += t
+    return out
+
+
+def split_arg_list(s):
+    return flatten([t.split("=") for t in s.split()])
+
+
+def main(arg_string=None):
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=100, metavar='N',
@@ -438,11 +477,17 @@ def main():
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N',
                         help='number of epochs to train (default: 1)')
-    parser.add_argument('--layers', type=str, default="200,40",
+    parser.add_argument('--epochs_before_regular_deriv', type=int, default=0,
+                        help='number of epochs to train with pseudoderivatives')
+    parser.add_argument('--layers', type=str, default="32,32,32",
                         help='comma-separated list of layer sizes')
+    parser.add_argument('--rbfi', action='store_true', default=False,
+                        help='Use RBFI nets')
     parser.add_argument('--rbf', action='store_true', default=False,
                         help='Use RBF nets')
-    parser.add_argument('--andor', type=str, default='**v',
+    parser.add_argument('--relu', action='store_true', default=False,
+                        help='Use ReLU neurons')
+    parser.add_argument('--andor', type=str, default='^v^v',
                         help='Type of neurons in RBF nets, ^ = and, v = or, * = random mix')
     parser.add_argument('--modinf', action='store_true', default=False,
                         help='Use infinity norm for RBFs')
@@ -470,6 +515,8 @@ def main():
                         help='Train also on adversarial examples computed with given attack quantity')
     parser.add_argument('--train_adv_steps', type=int, default=1,
                         help='Number of steps ')
+    parser.add_argument('--pseudo_adv', action='store_true', default=False,
+                        help='Use pseudoderivative in adversarial attacks.')
     parser.add_argument('--use_pgd_for_adv_training', action='store_true', default=False,
                         help='Use PGD for generating adversarial examples during training.')
     parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -504,14 +551,27 @@ def main():
                         help='Number of runs to perform')
     parser.add_argument('--model_file', type=str, default=None,
                         help='Model file from which to read the models.')
+    parser.add_argument('--continue_training', action='store_true', default=False,
+                        help='Continue training a given model')
+    parser.add_argument('--try_new_loss', action='store_true', default=False,
+                        help='Try new loss function for training RBFI.')
 
-
-    args = parser.parse_args()
+    if arg_string is None:
+        args = parser.parse_args()
+    else:
+        args = parser.parse_args(split_arg_list(arg_string))
+    if not (args.relu or args.sigmoid):
+        args.rbfi = True
+    # RBFI use rbf and modinf.
+    if args.rbfi:
+        args.rbf = True
+        args.modinf = True
     if args.lr is None:
         args.lr = 5. if args.rbf else 1.
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+
 
     train_loader = torch.utils.data.DataLoader(
         datasets.MNIST('../data', train=True, download=True,
@@ -533,7 +593,9 @@ def main():
               'accuracy_adv_multi': [],
               'accuracy_adv_multi_modinf': [],
               'accuracy_pert': [],
-              'accuracy_pgd': []}
+              'accuracy_pgd': [],
+              'accuracy_vs_pgd_restarts': [],
+              }
 
     if args.model_file is not None:
         out_fn = "measure_{}_[[{}]]".format(
@@ -565,7 +627,17 @@ def main():
         if args.model_file is None:
             # We create a new model.
             model = RBFNet(args).to(device) if args.rbf else StdNet(args).to(device)
-            # And we train it.
+        else:
+            # We read a model.
+            if args.runs > 1:
+                in_fn = args.model_file + '_{}.model.json'.format(run_idx)
+            else:
+                in_fn = args.model_file + '.model.json'
+            model = read_model(in_fn, device)
+            # Takes care of a few flags.
+            model.set_regular_deriv(args.regular_deriv)
+        if args.model_file is None or args.continue_training:
+            # Trains the model.
             # Creates an optimizer.
             params = filter(lambda p: p.requires_grad, model.parameters())
             if args.opt == 'mom':
@@ -578,17 +650,12 @@ def main():
             meta_optimizer = ParamBoundEnforcer(optimizer) if args.rbf else optimizer
             # Trains the model for given number of epochs.
             for epoch in range(1, args.epochs + 1):
+                if args.epochs_before_regular_deriv > 0 and epoch > args.epochs_before_regular_deriv:
+                    model.set_regular_deriv(True)
                 train(args, model, device, train_loader, meta_optimizer, epoch)
             # We write the model.
             model_fn = out_fn + '_{}.model.json'.format(run_idx)
             write_model(model, model_fn)
-        else:
-            # We read a model.
-            if args.runs > 1:
-                in_fn = args.model_file + '_{}.model.json'.format(run_idx)
-            else:
-                in_fn = args.model_file + '.model.json'
-            model = read_model(in_fn, device)
         # Now, we do the tests.
         accuracy, sensitivity = test(args, model, device, test_loader)
         output['accuracy_test'].append(accuracy)
@@ -600,8 +667,9 @@ def main():
         if args.test_pert:
             output['accuracy_pert'].append(test_perturbation(args, model, device, test_loader))
         if args.test_pgd:
-            output['accuracy_pgd'].append(test_pgd(args, model, device, kwargs))
-
+            accuracy_pgd, accuracy_vs_restarts_by_epsilon = test_pgd(args, model, device, kwargs)
+            output['accuracy_pgd'].append(accuracy_pgd)
+            output['accuracy_vs_pgd_restarts'].append(accuracy_vs_restarts_by_epsilon)
 
     with open(out_fn + '.json', 'w') as f:
         json.dump(output, f,

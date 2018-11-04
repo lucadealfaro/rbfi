@@ -47,7 +47,7 @@ class SharedFeedbackMax(Function):
         return d_complete * torch.exp(x - y_complete)
 
 
-class RBFPseudoDerivativeLayer(nn.Module):
+class RBFI(nn.Module):
 
     def __init__(self, in_features, out_features, andor="*",
                  modinf=False, regular_deriv=False,
@@ -64,7 +64,7 @@ class RBFPseudoDerivativeLayer(nn.Module):
         :param min_slope: min value for u, defining the slope.
         :param max_slope: max value for u, defining the slope.
         """
-        super(RBFPseudoDerivativeLayer, self).__init__()
+        super(RBFI, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.andor = andor
@@ -110,7 +110,7 @@ class RBFPseudoDerivativeLayer(nn.Module):
     def loads(s, device):
         """Reads itself from string s."""
         d = Serializable.loads(s)
-        m = RBFPseudoDerivativeLayer(
+        m = RBFI(
             d['in_features'],
             d['out_features'],
             andor=d['andor'],
@@ -191,8 +191,8 @@ class RBFPseudoDerivativeLayer(nn.Module):
 class TestRBF(unittest.TestCase):
 
     def setup_layer(self, andor="^", regular_deriv=False, modinf=False, single_norm=False):
-        layer = RBFPseudoDerivativeLayer(2, 3, andor=andor, modinf=modinf, regular_deriv=regular_deriv,
-                                         single_normalization=single_norm)
+        layer = RBFI(2, 3, andor=andor, modinf=modinf, regular_deriv=regular_deriv,
+                     single_normalization=single_norm)
         # I want to start from simple numbers.
         layer.w.data.mul_(0.)
         layer.u.data.mul_(0.)
